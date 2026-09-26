@@ -241,19 +241,17 @@ def extract_pairwise_features(s1_rec: Any, cand_rec: Any) -> List[float]:
         is_s3
     ]
 
-_G_S1_LOOKUP = None
-_G_TARGET_LOOKUP = None
-
-def _init_feature_worker(s1_lookup, target_lookup):
-    global _G_S1_LOOKUP, _G_TARGET_LOOKUP
-    _G_S1_LOOKUP = s1_lookup
-    _G_TARGET_LOOKUP = target_lookup
-
-def _batch_extract_pairwise_features_fast(pairs_chunk):
-    return [
-        extract_pairwise_features(_G_S1_LOOKUP[s1_id], _G_TARGET_LOOKUP[cand_id])
-        for s1_id, cand_id in pairs_chunk
-    ]
+def _batch_extract_pairwise_features_thread(pairs_chunk, s1_lookup, target_lookup):
+    res = []
+    default_feat = [0.0] * len(FEATURE_NAMES)
+    for s1_id, cand_id in pairs_chunk:
+        s1 = s1_lookup.get(s1_id)
+        target = target_lookup.get(cand_id)
+        if s1 is None or target is None:
+            res.append(default_feat)
+        else:
+            res.append(extract_pairwise_features(s1, target))
+    return res
 
 def extract_features_parallel(
     pairs: List[Tuple[str, str]],
@@ -263,15 +261,16 @@ def extract_features_parallel(
     n_jobs: int = -1
 ) -> np.ndarray:
     """
-    Extracts pairwise features in parallel across multiple CPU cores without IPC pickling overhead.
+    Extracts pairwise features in parallel across multiple CPU cores using threads (RapidFuzz releases GIL).
+    Zero IPC serialization overhead and zero memory duplication.
     """
     import os
-    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     if not pairs:
         return np.empty((0, len(FEATURE_NAMES)), dtype=np.float32)
 
-    max_workers = max(1, os.cpu_count() or 1) if n_jobs in (-1, None) else max(1, n_jobs)
+    max_workers = min(16, os.cpu_count() or 4) if n_jobs in (-1, None) else max(1, n_jobs)
 
     if len(pairs) < 5000 or max_workers == 1:
         return np.array([
@@ -286,13 +285,9 @@ def extract_features_parallel(
     ]
 
     results = [None] * num_batches
-    with ProcessPoolExecutor(
-        max_workers=max_workers, 
-        initializer=_init_feature_worker, 
-        initargs=(s1_lookup, target_lookup)
-    ) as executor:
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_idx = {
-            executor.submit(_batch_extract_pairwise_features_fast, batch): idx 
+            executor.submit(_batch_extract_pairwise_features_thread, batch, s1_lookup, target_lookup): idx 
             for idx, batch in enumerate(batches)
         }
         for future in as_completed(future_to_idx):

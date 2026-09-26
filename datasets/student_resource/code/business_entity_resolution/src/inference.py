@@ -19,7 +19,7 @@ def run_test_inference(
     threshold_s2: float = 0.86,
     threshold_s3: float = 0.86,
     model_type: str = 'xgboost',
-    max_candidates_per_s1: int = 100,
+    max_candidates_per_s1: int = 8,
     n_jobs: int = -1
 ):
     start_total_time = time.time()
@@ -106,15 +106,33 @@ def run_test_inference(
     matcher.fit(X_train, y_train)
     print("Model training complete!", flush=True)
 
-    print("\n================ 4. LOADING & NORMALIZING TEST DATA ================", flush=True)
-    test_s1 = load_source_tsv(os.path.join(test_dir, "test_source1.tsv"))
-    test_s2 = load_source_tsv(os.path.join(test_dir, "test_source2.tsv"))
-    test_s3 = load_source_tsv(os.path.join(test_dir, "test_source3.tsv"))
+    # Free training structures to keep memory minimal
+    del train_s1, train_s2, train_s3, gt_dict, train_s1_recs, train_s2_recs, train_s3_recs
+    del train_target_recs, train_target_lookup, train_s1_lookup, train_pairs, train_labels, X_train, y_train
+    import gc
+    gc.collect()
 
-    print("Normalizing test records...", flush=True)
+    print("\n================ 4. LOADING & NORMALIZING TEST DATA ================", flush=True)
+    print("Loading & normalizing test_source1.tsv...", flush=True)
+    test_s1 = load_source_tsv(os.path.join(test_dir, "test_source1.tsv"))
     test_s1_recs = normalize_dataframe(test_s1)
+    del test_s1
+    gc.collect()
+    print(f"Normalized {len(test_s1_recs)} test S1 records.", flush=True)
+
+    print("Loading & normalizing test_source2.tsv...", flush=True)
+    test_s2 = load_source_tsv(os.path.join(test_dir, "test_source2.tsv"))
     test_s2_recs = normalize_dataframe(test_s2)
+    del test_s2
+    gc.collect()
+    print(f"Normalized {len(test_s2_recs)} test S2 records.", flush=True)
+
+    print("Loading & normalizing test_source3.tsv...", flush=True)
+    test_s3 = load_source_tsv(os.path.join(test_dir, "test_source3.tsv"))
     test_s3_recs = normalize_dataframe(test_s3)
+    del test_s3
+    gc.collect()
+    print(f"Normalized {len(test_s3_recs)} test S3 records.", flush=True)
     
     test_target_recs = test_s2_recs + test_s3_recs
     test_target_lookup = {r['entity_id']: r for r in test_target_recs}
@@ -213,18 +231,62 @@ def run_test_inference(
     print(f"Pipeline finished successfully in {time.time() - start_total_time:.2f}s!")
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Run test inference for business entity resolution")
+    parser.add_argument("--train-dir", type=str, default=None, help="Path to train directory")
+    parser.add_argument("--test-dir", type=str, default=None, help="Path to test directory")
+    parser.add_argument("--output-dir", type=str, default=None, help="Path to output directory")
+    parser.add_argument("--threshold-s2", type=float, default=0.78, help="Threshold for source 2")
+    parser.add_argument("--threshold-s3", type=float, default=0.78, help="Threshold for source 3")
+    parser.add_argument("--model-type", type=str, default="xgboost", help="Model type")
+    args = parser.parse_args()
+
     script_dir = os.path.dirname(os.path.abspath(__file__))
     root_dir = os.path.abspath(os.path.join(script_dir, "..", "..", ".."))
-    
-    train_dir = os.path.join(root_dir, "dataset", "train")
-    test_dir = os.path.join(root_dir, "dataset", "test")
-    output_dir = os.path.join(root_dir, "output")
-    
+
+    # Resolve train_dir dynamically if not specified
+    train_dir = args.train_dir
+    if not train_dir:
+        train_candidates = [
+            os.path.join(root_dir, "dataset", "train"),
+            os.path.join(root_dir, "dataset", "dataset", "train"),
+            os.path.abspath("dataset/train"),
+            os.path.abspath("datasets/student_resource/dataset/train"),
+        ]
+        for p in train_candidates:
+            if os.path.isdir(p) and os.path.exists(os.path.join(p, "train_source1.tsv")):
+                train_dir = p
+                break
+        if not train_dir:
+            train_dir = os.path.join(root_dir, "dataset", "train")
+
+    # Resolve test_dir dynamically if not specified
+    test_dir = args.test_dir
+    if not test_dir:
+        test_candidates = [
+            os.path.join(root_dir, "dataset", "test"),
+            os.path.join(root_dir, "dataset", "dataset", "test"),
+            os.path.abspath("dataset/test"),
+            os.path.abspath("datasets/student_resource/dataset/test"),
+        ]
+        for p in test_candidates:
+            if os.path.isdir(p) and os.path.exists(os.path.join(p, "test_source1.tsv")):
+                test_dir = p
+                break
+        if not test_dir:
+            test_dir = os.path.join(root_dir, "dataset", "test")
+
+    output_dir = args.output_dir or os.path.join(root_dir, "output")
+
+    print(f"Using train directory: {train_dir}", flush=True)
+    print(f"Using test directory: {test_dir}", flush=True)
+    print(f"Using output directory: {output_dir}", flush=True)
+
     run_test_inference(
         train_dir=train_dir,
         test_dir=test_dir,
         output_dir=output_dir,
-        threshold_s2=0.78,
-        threshold_s3=0.78,
-        model_type='xgboost'
+        threshold_s2=args.threshold_s2,
+        threshold_s3=args.threshold_s3,
+        model_type=args.model_type
     )
