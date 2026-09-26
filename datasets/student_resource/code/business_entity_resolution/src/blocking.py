@@ -53,31 +53,51 @@ class MultiPassBlocker:
         self.max_candidates_per_s1 = max_candidates_per_s1
         self.tfidf_top_k = tfidf_top_k
         self.inverted_indexes = defaultdict(lambda: defaultdict(list))
+        self.tfidf_vectorizer = None
+        self.target_tfidf_mat = None
+        self.target_ids_arr = None
         
     def fit_index_target_records(self, target_records: List[dict]):
         """
         Builds high-recall multi-pass inverted indexes for candidate records.
+        Also pre-fits and pre-calculates TF-IDF target embeddings.
         """
         self.target_records = target_records
-        self.target_ids = [r['entity_id'] for r in target_records]
+        self.target_ids = [r['entity_id'] if isinstance(r, dict) else r.entity_id for r in target_records]
+        self.target_ids_arr = np.array(self.target_ids)
         
+        target_names = []
         for idx, r in enumerate(target_records):
-            eid = r['entity_id']
+            if isinstance(r, dict):
+                eid = r.get('entity_id', '')
+                nb = r.get('name_basic', '')
+                ns = r.get('name_no_suf', '')
+                na = r.get('name_alnum', '')
+                nss = r.get('name_no_suf_sorted', '') or (" ".join(sorted(ns.split())) if ns else '')
+                orig_name = r.get('original_name', '')
+                ab = r.get('addr_basic', '')
+                hnum = r.get('house_num', '') or extract_digits(ab)
+                pcode = r.get('postal_code', '')
+            else:
+                eid = r.entity_id
+                nb = r.name_basic
+                ns = r.name_no_suf
+                na = r.name_alnum
+                nss = r.name_no_suf_sorted or (" ".join(sorted(ns.split())) if ns else '')
+                orig_name = r.original_name
+                ab = r.addr_basic
+                hnum = r.house_num or extract_digits(ab)
+                pcode = r.postal_code
+
+            target_names.append(ns)
             
             # 1. Exact Name & Variant Keys
-            nb = r.get('name_basic', '')
             if nb:
                 self.inverted_indexes['name_basic'][nb].append(eid)
-                
-            ns = r.get('name_no_suf', '')
             if ns:
                 self.inverted_indexes['name_no_suf'][ns].append(eid)
-
-            na = r.get('name_alnum', '')
             if na:
                 self.inverted_indexes['name_alnum'][na].append(eid)
-                
-            nss = r.get('name_no_suf_sorted', '') or (" ".join(sorted(ns.split())) if ns else '')
             if nss:
                 self.inverted_indexes['name_no_suf_sorted'][nss].append(eid)
                 
@@ -87,7 +107,7 @@ class MultiPassBlocker:
                 self.inverted_indexes['name_compact'][ncomp].append(eid)
 
             # Domain Stem
-            dstem = extract_domain_stem(r.get('original_name', ''))
+            dstem = extract_domain_stem(orig_name)
             if dstem:
                 self.inverted_indexes['domain_stem'][dstem].append(eid)
                 self.inverted_indexes['name_compact'][dstem].append(eid)
@@ -109,7 +129,6 @@ class MultiPassBlocker:
                     self.inverted_indexes['sort_pair'][sort_pair].append(eid)
 
             # 4. Address 2-Token Pairs
-            ab = r.get('addr_basic', '')
             addr_toks = [t for t in re.findall(r'\b[a-z0-9]{3,}\b', ab) if t not in COMMON_ADDR_STOPWORDS and not t.isdigit()]
             if len(addr_toks) >= 2:
                 for i in range(len(addr_toks) - 1):
@@ -123,15 +142,14 @@ class MultiPassBlocker:
                 if tokens:
                     self.inverted_indexes['code_token'][f"{ac}_{tokens[0]}"].append(eid)
 
-            # 6. House Number / Street Digits + Name Token
-            hnum = r.get('house_num', '') or extract_digits(ab)
-            pcode = r.get('postal_code', '')
-            
+            # 6. House Number / Street Digits + Name Token / Address Fallbacks
             if hnum:
                 for t in tokens[:4]:
                     self.inverted_indexes['num_token'][f"{hnum}_{t}"].append(eid)
                 if addr_toks:
                     self.inverted_indexes['num_addr_token'][f"{hnum}_{addr_toks[0]}"].append(eid)
+                if len(addr_toks) >= 2:
+                    self.inverted_indexes['num_addr_pair'][f"{hnum}_{addr_toks[0]}_{addr_toks[1]}"].append(eid)
 
             if pcode and len(pcode) >= 3:
                 self.inverted_indexes['postal'][pcode].append(eid)
@@ -146,150 +164,242 @@ class MultiPassBlocker:
             if addr_digits and len(addr_digits) >= 3:
                 self.inverted_indexes['addr_digits'][addr_digits].append(eid)
 
-    def generate_candidates(self, s1_records: List[dict]) -> Dict[str, Set[str]]:
+        # Pre-fit TF-IDF Vectorizer once for all target records
+        self.tfidf_vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=1)
+        self.tfidf_vectorizer.fit(target_names)
+        self.target_tfidf_mat = self.tfidf_vectorizer.transform(target_names)
+
+    def generate_candidates(self, s1_records: List[dict], n_jobs: int = -1) -> Dict[str, Set[str]]:
         """
         Generates candidate pool with priority-ordered candidate selection.
-        High-precision passes (exact name, token pairs) are preserved first.
+        Supports multi-core parallel execution with process-shared indexes.
         """
+        num_s1 = len(s1_records)
+        s1_names = [r.get('name_no_suf', '') if isinstance(r, dict) else r.name_no_suf for r in s1_records]
+
         try:
-            s1_names = [r.get('name_no_suf', '') for r in s1_records]
-            target_names = [r.get('name_no_suf', '') for r in self.target_records]
-            tfidf_cands_list = generate_tfidf_candidates_chunked(
-                s1_names, target_names, self.target_ids, top_k=self.tfidf_top_k, min_sim=0.15
+            tfidf_cands_list = generate_tfidf_candidates_prefit(
+                self.tfidf_vectorizer, s1_names, self.target_tfidf_mat, self.target_ids_arr, top_k=self.tfidf_top_k, min_sim=0.15
             )
         except Exception:
             tfidf_cands_list = [[] for _ in s1_records]
 
+        inv_idx = dict(self.inverted_indexes)
+        max_cands = self.max_candidates_per_s1
+
+        import os
+        from concurrent.futures import ProcessPoolExecutor, as_completed
+
+        max_workers = max(1, os.cpu_count() or 1) if n_jobs in (-1, None) else max(1, n_jobs)
+
+        if num_s1 <= 2000 or max_workers == 1:
+            return _process_candidate_chunk(s1_records, tfidf_cands_list, inv_idx, max_cands)
+
+        # Multi-core processing with worker initializer to eliminate pickle overhead
+        batch_size = max(1000, (num_s1 + max_workers * 4 - 1) // (max_workers * 4))
+        num_batches = (num_s1 + batch_size - 1) // batch_size
+
+        batches = [
+            (s1_records[i * batch_size:(i + 1) * batch_size],
+             tfidf_cands_list[i * batch_size:(i + 1) * batch_size],
+             max_cands)
+            for i in range(num_batches)
+        ]
+
         final_candidates = {}
-        
-        for r, tfidf_cands in zip(s1_records, tfidf_cands_list):
+        with ProcessPoolExecutor(
+            max_workers=max_workers, 
+            initializer=_init_blocker_worker, 
+            initargs=(inv_idx,)
+        ) as executor:
+            futures = [executor.submit(_process_candidate_chunk_fast, b) for b in batches]
+            for future in as_completed(futures):
+                final_candidates.update(future.result())
+
+        return final_candidates
+
+_G_INVERTED_INDEXES = None
+
+def _init_blocker_worker(inverted_indexes):
+    global _G_INVERTED_INDEXES
+    _G_INVERTED_INDEXES = inverted_indexes
+
+def _process_candidate_chunk_fast(args):
+    s1_chunk, tfidf_chunk, max_candidates_per_s1 = args
+    return _process_candidate_chunk(s1_chunk, tfidf_chunk, _G_INVERTED_INDEXES, max_candidates_per_s1)
+
+def _process_candidate_chunk(s1_chunk, tfidf_chunk, inverted_indexes, max_candidates_per_s1):
+    final_candidates = {}
+    for r, tfidf_cands in zip(s1_chunk, tfidf_chunk):
+        if isinstance(r, dict):
             s1_id = r['entity_id']
-            ordered_cands = []
-            seen = set()
-            
-            def add_cands(cand_list):
-                for cid in cand_list:
-                    if cid not in seen:
-                        seen.add(cid)
-                        ordered_cands.append(cid)
-
-            # Tier 1: Exact Name & Variants (Highest Confidence)
             nb = r.get('name_basic', '')
-            if nb:
-                add_cands(self.inverted_indexes['name_basic'].get(nb, []))
-                
             ns = r.get('name_no_suf', '')
-            if ns:
-                add_cands(self.inverted_indexes['name_no_suf'].get(ns, []))
-
             na = r.get('name_alnum', '')
-            if na:
-                add_cands(self.inverted_indexes['name_alnum'].get(na, []))
-                
             nss = r.get('name_no_suf_sorted', '') or (" ".join(sorted(ns.split())) if ns else '')
-            if nss:
-                add_cands(self.inverted_indexes['name_no_suf_sorted'].get(nss, []))
-
-            # Compact Name & Domain Stem
-            ncomp = extract_compact_name(ns)
-            if ncomp and len(ncomp) >= 4:
-                add_cands(self.inverted_indexes['name_compact'].get(ncomp, []))
-
-            dstem = extract_domain_stem(r.get('original_name', ''))
-            if dstem:
-                add_cands(self.inverted_indexes['domain_stem'].get(dstem, []))
-                add_cands(self.inverted_indexes['name_compact'].get(dstem, []))
-
-            # Tier 2: Token Pairs (Adjacent & Combinations)
-            tokens = [t for t in ns.split() if t not in COMMON_NAME_STOPWORDS and len(t) >= 2]
-            if len(tokens) >= 2:
-                for i in range(len(tokens) - 1):
-                    pair_key = f"{tokens[i]}_{tokens[i+1]}"
-                    add_cands(self.inverted_indexes['token_pair'].get(pair_key, []))
-            elif len(tokens) == 1:
-                matches = self.inverted_indexes['single_token'].get(tokens[0], [])
-                if len(matches) <= 500:
-                    add_cands(matches)
-
-            all_name_tokens = sorted(list(set([t for t in ns.split() if len(t) >= 2])))
-            if len(all_name_tokens) >= 2:
-                for t1, t2 in combinations(all_name_tokens[:10], 2):
-                    sort_pair = f"{t1}_{t2}"
-                    add_cands(self.inverted_indexes['sort_pair'].get(sort_pair, []))
-
-            # Tier 3: House Number / Postal Code / Address Codes
+            orig_name = r.get('original_name', '')
             ab = r.get('addr_basic', '')
             hnum = r.get('house_num', '') or extract_digits(ab)
             pcode = r.get('postal_code', '')
-            addr_toks = [t for t in re.findall(r'\b[a-z0-9]{3,}\b', ab) if t not in COMMON_ADDR_STOPWORDS and not t.isdigit()]
+        else:
+            s1_id = r.entity_id
+            nb = r.name_basic
+            ns = r.name_no_suf
+            na = r.name_alnum
+            nss = r.name_no_suf_sorted or (" ".join(sorted(ns.split())) if ns else '')
+            orig_name = r.original_name
+            ab = r.addr_basic
+            hnum = r.house_num or extract_digits(ab)
+            pcode = r.postal_code
 
-            acodes = extract_addr_codes(ab)
-            for ac in acodes:
-                ac_matches = self.inverted_indexes['addr_code'].get(ac, [])
-                if len(ac_matches) <= 300:
-                    add_cands(ac_matches)
-                if tokens:
-                    add_cands(self.inverted_indexes['code_token'].get(f"{ac}_{tokens[0]}", []))
+        ordered_cands = []
+        seen = set()
 
-            if hnum:
-                for t in tokens[:4]:
-                    num_token_key = f"{hnum}_{t}"
-                    add_cands(self.inverted_indexes['num_token'].get(num_token_key, []))
-                if addr_toks:
-                    num_addr_key = f"{hnum}_{addr_toks[0]}"
-                    add_cands(self.inverted_indexes['num_addr_token'].get(num_addr_key, []))
-                
-            if pcode and len(pcode) >= 3:
-                if hnum:
-                    add_cands(self.inverted_indexes['postal_house'].get(pcode + '_' + hnum, []))
-                if tokens:
-                    for t in tokens[:3]:
-                        add_cands(self.inverted_indexes['postal_token'].get(pcode + '_' + t, []))
-                p_matches = self.inverted_indexes['postal'].get(pcode, [])
-                if len(p_matches) <= 300:
-                    add_cands(p_matches)
-
-            # Tier 4: Address Token Pairs & Digits
-            if len(addr_toks) >= 2:
-                for i in range(len(addr_toks) - 1):
-                    apair = f"{addr_toks[i]}_{addr_toks[i+1]}"
-                    matches = self.inverted_indexes['addr_pair'].get(apair, [])
-                    if len(matches) <= 300:
-                        add_cands(matches)
-
-            addr_digits = extract_digits(ab)
-            if addr_digits and len(addr_digits) >= 3:
-                ad_matches = self.inverted_indexes['addr_digits'].get(addr_digits, [])
-                if len(ad_matches) <= 300:
-                    add_cands(ad_matches)
-
-            # Tier 5: TF-IDF Character N-gram Cosine Candidates
-            add_cands(tfidf_cands)
-
-            # Cap ordered candidates safely
-            final_candidates[s1_id] = set(ordered_cands[:self.max_candidates_per_s1])
+        # Tier 1: Exact Name & Variants (Highest Confidence)
+        if nb:
+            for cid in inverted_indexes.get('name_basic', {}).get(nb, []):
+                if cid not in seen:
+                    seen.add(cid); ordered_cands.append(cid)
             
-        return final_candidates
+        if ns:
+            for cid in inverted_indexes.get('name_no_suf', {}).get(ns, []):
+                if cid not in seen:
+                    seen.add(cid); ordered_cands.append(cid)
 
-def generate_tfidf_candidates_chunked(
+        if na:
+            for cid in inverted_indexes.get('name_alnum', {}).get(na, []):
+                if cid not in seen:
+                    seen.add(cid); ordered_cands.append(cid)
+            
+        if nss:
+            for cid in inverted_indexes.get('name_no_suf_sorted', {}).get(nss, []):
+                if cid not in seen:
+                    seen.add(cid); ordered_cands.append(cid)
+
+        # Compact Name & Domain Stem
+        ncomp = extract_compact_name(ns)
+        if ncomp and len(ncomp) >= 4:
+            for cid in inverted_indexes.get('name_compact', {}).get(ncomp, []):
+                if cid not in seen:
+                    seen.add(cid); ordered_cands.append(cid)
+
+        dstem = extract_domain_stem(orig_name)
+        if dstem:
+            for cid in inverted_indexes.get('domain_stem', {}).get(dstem, []):
+                if cid not in seen:
+                    seen.add(cid); ordered_cands.append(cid)
+            for cid in inverted_indexes.get('name_compact', {}).get(dstem, []):
+                if cid not in seen:
+                    seen.add(cid); ordered_cands.append(cid)
+
+        # Tier 2: Token Pairs (Adjacent & Combinations)
+        tokens = [t for t in ns.split() if t not in COMMON_NAME_STOPWORDS and len(t) >= 2]
+        if len(tokens) >= 2:
+            for i in range(len(tokens) - 1):
+                pair_key = f"{tokens[i]}_{tokens[i+1]}"
+                for cid in inverted_indexes.get('token_pair', {}).get(pair_key, []):
+                    if cid not in seen:
+                        seen.add(cid); ordered_cands.append(cid)
+        elif len(tokens) == 1:
+            matches = inverted_indexes.get('single_token', {}).get(tokens[0], [])
+            if len(matches) <= 500:
+                for cid in matches:
+                    if cid not in seen:
+                        seen.add(cid); ordered_cands.append(cid)
+
+        all_name_tokens = sorted(list(set([t for t in ns.split() if len(t) >= 2])))
+        if len(all_name_tokens) >= 2:
+            for t1, t2 in combinations(all_name_tokens[:10], 2):
+                sort_pair = f"{t1}_{t2}"
+                for cid in inverted_indexes.get('sort_pair', {}).get(sort_pair, []):
+                    if cid not in seen:
+                        seen.add(cid); ordered_cands.append(cid)
+
+        # Tier 3: House Number / Postal Code / Address Codes
+        addr_toks = [t for t in re.findall(r'\b[a-z0-9]{3,}\b', ab) if t not in COMMON_ADDR_STOPWORDS and not t.isdigit()]
+        acodes = extract_addr_codes(ab)
+        for ac in acodes:
+            ac_matches = inverted_indexes.get('addr_code', {}).get(ac, [])
+            if len(ac_matches) <= 300:
+                for cid in ac_matches:
+                    if cid not in seen:
+                        seen.add(cid); ordered_cands.append(cid)
+            if tokens:
+                for cid in inverted_indexes.get('code_token', {}).get(f"{ac}_{tokens[0]}", []):
+                    if cid not in seen:
+                        seen.add(cid); ordered_cands.append(cid)
+
+        if hnum:
+            for t in tokens[:4]:
+                for cid in inverted_indexes.get('num_token', {}).get(f"{hnum}_{t}", []):
+                    if cid not in seen:
+                        seen.add(cid); ordered_cands.append(cid)
+            if addr_toks:
+                for cid in inverted_indexes.get('num_addr_token', {}).get(f"{hnum}_{addr_toks[0]}", []):
+                    if cid not in seen:
+                        seen.add(cid); ordered_cands.append(cid)
+            if len(addr_toks) >= 2:
+                for cid in inverted_indexes.get('num_addr_pair', {}).get(f"{hnum}_{addr_toks[0]}_{addr_toks[1]}", []):
+                    if cid not in seen:
+                        seen.add(cid); ordered_cands.append(cid)
+            
+        if pcode and len(pcode) >= 3:
+            if hnum:
+                for cid in inverted_indexes.get('postal_house', {}).get(pcode + '_' + hnum, []):
+                    if cid not in seen:
+                        seen.add(cid); ordered_cands.append(cid)
+            if tokens:
+                for t in tokens[:3]:
+                    for cid in inverted_indexes.get('postal_token', {}).get(pcode + '_' + t, []):
+                        if cid not in seen:
+                            seen.add(cid); ordered_cands.append(cid)
+            p_matches = inverted_indexes.get('postal', {}).get(pcode, [])
+            if len(p_matches) <= 300:
+                for cid in p_matches:
+                    if cid not in seen:
+                        seen.add(cid); ordered_cands.append(cid)
+
+        # Tier 4: Address Token Pairs & Digits
+        if len(addr_toks) >= 2:
+            for i in range(len(addr_toks) - 1):
+                apair = f"{addr_toks[i]}_{addr_toks[i+1]}"
+                matches = inverted_indexes.get('addr_pair', {}).get(apair, [])
+                if len(matches) <= 300:
+                    for cid in matches:
+                        if cid not in seen:
+                            seen.add(cid); ordered_cands.append(cid)
+
+        addr_digits = extract_digits(ab)
+        if addr_digits and len(addr_digits) >= 3:
+            ad_matches = inverted_indexes.get('addr_digits', {}).get(addr_digits, [])
+            if len(ad_matches) <= 300:
+                for cid in ad_matches:
+                    if cid not in seen:
+                        seen.add(cid); ordered_cands.append(cid)
+
+        # Tier 5: TF-IDF Character N-gram Cosine Candidates
+        for cid in tfidf_cands:
+            if cid not in seen:
+                seen.add(cid); ordered_cands.append(cid)
+
+        # Cap ordered candidates safely
+        final_candidates[s1_id] = set(ordered_cands[:max_candidates_per_s1])
+
+    return final_candidates
+
+def generate_tfidf_candidates_prefit(
+    vectorizer: TfidfVectorizer,
     s1_names: List[str], 
-    target_names: List[str], 
-    target_ids: List[str],
+    target_mat: csr_matrix, 
+    target_ids_arr: np.ndarray,
     top_k: int = 35,
     min_sim: float = 0.15,
-    chunk_size: int = 5000
+    chunk_size: int = 10000
 ) -> List[List[str]]:
     """
-    Computes top-K TF-IDF character n-gram cosine candidates using sparse dot product.
+    Computes top-K TF-IDF character n-gram cosine candidates using pre-fitted target TF-IDF matrix.
     """
-    vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=1)
-    all_names = s1_names + target_names
-    vectorizer.fit(all_names)
-    
     s1_mat = vectorizer.transform(s1_names)
-    target_mat = vectorizer.transform(target_names)
-    
-    target_ids_arr = np.array(target_ids)
     num_s1 = s1_mat.shape[0]
     
     results = []
@@ -298,19 +408,23 @@ def generate_tfidf_candidates_chunked(
         s1_chunk = s1_mat[start:end]
         
         sim_mat = s1_chunk.dot(target_mat.T)
+        indptr = sim_mat.indptr
+        data = sim_mat.data
+        indices = sim_mat.indices
         
         for i in range(sim_mat.shape[0]):
-            row = sim_mat[i]
-            if row.nnz == 0:
+            r_start = indptr[i]
+            r_end = indptr[i + 1]
+            if r_start == r_end:
                 results.append([])
                 continue
                 
-            data = row.data
-            indices = row.indices
+            r_data = data[r_start:r_end]
+            r_indices = indices[r_start:r_end]
             
-            mask = data >= min_sim
-            data_filtered = data[mask]
-            indices_filtered = indices[mask]
+            mask = r_data >= min_sim
+            data_filtered = r_data[mask]
+            indices_filtered = r_indices[mask]
             
             if len(data_filtered) == 0:
                 results.append([])
@@ -324,3 +438,5 @@ def generate_tfidf_candidates_chunked(
             results.append(cand_eids)
             
     return results
+
+

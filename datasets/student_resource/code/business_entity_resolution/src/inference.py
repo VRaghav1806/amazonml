@@ -8,7 +8,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from normalization import build_normalized_record_views
 from blocking import MultiPassBlocker
-from features import extract_pairwise_features
+from features import extract_pairwise_features, extract_features_parallel
 from models import PairMatcher, EntityDecisionEngine
 from dataset_utils import load_source_tsv, load_ground_truth_dict, normalize_dataframe
 
@@ -18,8 +18,11 @@ def run_test_inference(
     output_dir: str,
     threshold_s2: float = 0.86,
     threshold_s3: float = 0.86,
-    model_type: str = 'xgboost'
+    model_type: str = 'xgboost',
+    max_candidates_per_s1: int = 100,
+    n_jobs: int = -1
 ):
+    start_total_time = time.time()
     os.makedirs(output_dir, exist_ok=True)
     print("================ 1. LOADING & NORMALIZING ALL DATA ================", flush=True)
     
@@ -59,12 +62,12 @@ def run_test_inference(
     train_s1_lookup = {r['entity_id']: r for r in train_s1_recs}
 
     print("\n================ 2. BUILDING TRAINING BLOCKING & FEATURES ================", flush=True)
-    blocker = MultiPassBlocker(max_candidates_per_s1=300)
+    blocker = MultiPassBlocker(max_candidates_per_s1=max_candidates_per_s1)
     blocker.fit_index_target_records(train_target_recs)
     
     # Generate candidates for train
-    print("Generating candidates for training set...", flush=True)
-    train_candidates = blocker.generate_candidates(train_s1_recs)
+    print("Generating candidates for training set (multi-core)...", flush=True)
+    train_candidates = blocker.generate_candidates(train_s1_recs, n_jobs=n_jobs)
     
     train_pairs = []
     train_labels = []
@@ -92,12 +95,11 @@ def run_test_inference(
 
     print(f"Total training pairs: {len(train_pairs)} (Positives: {sum(train_labels)})", flush=True)
     
-    print("Extracting features for training pairs...", flush=True)
-    X_train = np.array([
-        extract_pairwise_features(train_s1_lookup[s1_id], train_target_lookup[cand_id])
-        for s1_id, cand_id in train_pairs
-    ], dtype=np.float32)
+    print("Extracting features for training pairs (parallel multi-core)...", flush=True)
+    t_feat_start = time.time()
+    X_train = extract_features_parallel(train_pairs, train_s1_lookup, train_target_lookup, n_jobs=n_jobs)
     y_train = np.array(train_labels, dtype=int)
+    print(f"Training features extracted in {time.time() - t_feat_start:.2f}s", flush=True)
 
     print(f"\n================ 3. TRAINING FINAL MODEL ({model_type.upper()}) ================", flush=True)
     matcher = PairMatcher(model_type=model_type)
@@ -119,56 +121,63 @@ def run_test_inference(
     test_s1_lookup = {r['entity_id']: r for r in test_s1_recs}
 
     print("\n================ 5. GENERATING TEST CANDIDATES ================", flush=True)
-    test_blocker = MultiPassBlocker(max_candidates_per_s1=300)
+    test_blocker = MultiPassBlocker(max_candidates_per_s1=max_candidates_per_s1)
     test_blocker.fit_index_target_records(test_target_recs)
     
-    test_candidates = test_blocker.generate_candidates(test_s1_recs)
+    t_cand_start = time.time()
+    test_candidates = test_blocker.generate_candidates(test_s1_recs, n_jobs=n_jobs)
+    print(f"Test candidate generation complete in {time.time() - t_cand_start:.2f}s", flush=True)
 
+    # Save candidate_pairs.tsv
     # Save candidate_pairs.tsv
     candidate_file_path = os.path.join(output_dir, "candidate_pairs.tsv")
     print(f"Writing candidate_pairs.tsv to {candidate_file_path}...", flush=True)
     
+    cand_lines = ["source1_entity_id\tcandidate_entity_ids\n"]
     with open(candidate_file_path, "w", encoding="utf-8") as f:
-        f.write("source1_entity_id\tcandidate_entity_ids\n")
         for r in test_s1_recs:
-            s1_id = r['entity_id']
+            s1_id = r['entity_id'] if isinstance(r, dict) else r.entity_id
             cands = sorted(list(test_candidates.get(s1_id, set())))
             cand_str = ",".join(cands)
-            f.write(f"{s1_id}\t{cand_str}\n")
+            cand_lines.append(f"{s1_id}\t{cand_str}\n")
+            if len(cand_lines) >= 50000:
+                f.writelines(cand_lines)
+                cand_lines.clear()
+        if cand_lines:
+            f.writelines(cand_lines)
             
     print("candidate_pairs.tsv written successfully!", flush=True)
 
     print("\n================ 6. INFERENCE & SCORING TEST PAIRS ================", flush=True)
     test_pairs = []
     for r in test_s1_recs:
-        s1_id = r['entity_id']
+        s1_id = r['entity_id'] if isinstance(r, dict) else r.entity_id
         cands = test_candidates.get(s1_id, set())
         for cand_id in cands:
             test_pairs.append((s1_id, cand_id))
 
     print(f"Total test candidate pairs to score: {len(test_pairs)}", flush=True)
     
-    # Process test features in chunks to save memory
-    chunk_size = 200000
+    # Process test features in chunks using multi-core parallel extraction
+    chunk_size = 250000
     test_probs = []
     
+    t_infer_start = time.time()
     for start in range(0, len(test_pairs), chunk_size):
         end = min(start + chunk_size, len(test_pairs))
         chunk_pairs = test_pairs[start:end]
+        print(f"Extracting features & scoring test chunk [{start}..{end}]...", flush=True)
         
-        X_chunk = np.array([
-            extract_pairwise_features(test_s1_lookup[s1_id], test_target_lookup[cand_id])
-            for s1_id, cand_id in chunk_pairs
-        ], dtype=np.float32)
-        
+        X_chunk = extract_features_parallel(chunk_pairs, test_s1_lookup, test_target_lookup, n_jobs=n_jobs)
         chunk_probs = matcher.predict_proba(X_chunk)
         test_probs.extend(chunk_probs)
         
     test_probs = np.array(test_probs)
+    print(f"Test pair scoring complete in {time.time() - t_infer_start:.2f}s", flush=True)
 
     print("\n================ 7. SINGLETON & MULTI-MATCH RESOLUTION ================", flush=True)
     engine = EntityDecisionEngine(threshold_s2=threshold_s2, threshold_s3=threshold_s3)
-    test_s1_ids = [r['entity_id'] for r in test_s1_recs]
+    test_s1_ids = [r['entity_id'] if isinstance(r, dict) else r.entity_id for r in test_s1_recs]
     
     final_matches = engine.predict_entity_matches(test_s1_ids, test_pairs, test_probs)
     
@@ -178,24 +187,30 @@ def run_test_inference(
     
     num_singletons = 0
     num_matches = 0
+    match_lines = ["source1_entity_id\tmatched_entity_ids\n"]
     
     with open(matching_file_path, "w", encoding="utf-8") as f:
-        f.write("source1_entity_id\tmatched_entity_ids\n")
         for r in test_s1_recs:
-            s1_id = r['entity_id']
+            s1_id = r['entity_id'] if isinstance(r, dict) else r.entity_id
             m_set = final_matches.get(s1_id, set())
             if not m_set:
                 num_singletons += 1
-                f.write(f"{s1_id}\t\n")
+                match_lines.append(f"{s1_id}\t\n")
             else:
                 num_matches += 1
                 m_str = ",".join(sorted(list(m_set)))
-                f.write(f"{s1_id}\t{m_str}\n")
+                match_lines.append(f"{s1_id}\t{m_str}\n")
+            if len(match_lines) >= 50000:
+                f.writelines(match_lines)
+                match_lines.clear()
+        if match_lines:
+            f.writelines(match_lines)
 
     print(f"matching_results.tsv written successfully!")
     print(f"Total Test Entities: {len(test_s1_recs)}")
     print(f"Predicted Singletons (no match): {num_singletons} ({(num_singletons/len(test_s1_recs))*100:.2f}%)")
     print(f"Predicted Matched Entities: {num_matches} ({(num_matches/len(test_s1_recs))*100:.2f}%)")
+    print(f"Pipeline finished successfully in {time.time() - start_total_time:.2f}s!")
 
 if __name__ == "__main__":
     script_dir = os.path.dirname(os.path.abspath(__file__))
