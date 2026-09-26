@@ -49,7 +49,7 @@ def extract_compact_name(name: str) -> str:
     return clean
 
 class MultiPassBlocker:
-    def __init__(self, max_candidates_per_s1: int = 300, tfidf_top_k: int = 35):
+    def __init__(self, max_candidates_per_s1: int = 8, tfidf_top_k: int = 5):
         self.max_candidates_per_s1 = max_candidates_per_s1
         self.tfidf_top_k = tfidf_top_k
         self.inverted_indexes = defaultdict(lambda: defaultdict(list))
@@ -164,8 +164,10 @@ class MultiPassBlocker:
             if addr_digits and len(addr_digits) >= 3:
                 self.inverted_indexes['addr_digits'][addr_digits].append(eid)
 
-        # Pre-fit TF-IDF Vectorizer once for all target records
-        self.tfidf_vectorizer = TfidfVectorizer(analyzer='char_wb', ngram_range=(3, 4), min_df=1)
+        # Pre-fit TF-IDF Vectorizer once for all target records with memory-safe settings
+        self.tfidf_vectorizer = TfidfVectorizer(
+            analyzer='char_wb', ngram_range=(3, 4), min_df=5, max_features=100000, dtype=np.float32
+        )
         self.tfidf_vectorizer.fit(target_names)
         self.target_tfidf_mat = self.tfidf_vectorizer.transform(target_names)
 
@@ -188,15 +190,15 @@ class MultiPassBlocker:
         max_cands = self.max_candidates_per_s1
 
         import os
-        from concurrent.futures import ProcessPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        max_workers = max(1, os.cpu_count() or 1) if n_jobs in (-1, None) else max(1, n_jobs)
+        max_workers = min(16, os.cpu_count() or 4) if n_jobs in (-1, None) else max(1, n_jobs)
 
         if num_s1 <= 2000 or max_workers == 1:
             return _process_candidate_chunk(s1_records, tfidf_cands_list, inv_idx, max_cands)
 
-        # Multi-core processing with worker initializer to eliminate pickle overhead
-        batch_size = max(1000, (num_s1 + max_workers * 4 - 1) // (max_workers * 4))
+        # Multi-thread processing: threads share inverted_indexes in-memory with ZERO pickling overhead
+        batch_size = max(5000, (num_s1 + max_workers * 4 - 1) // (max_workers * 4))
         num_batches = (num_s1 + batch_size - 1) // batch_size
 
         batches = [
@@ -207,26 +209,16 @@ class MultiPassBlocker:
         ]
 
         final_candidates = {}
-        with ProcessPoolExecutor(
-            max_workers=max_workers, 
-            initializer=_init_blocker_worker, 
-            initargs=(inv_idx,)
-        ) as executor:
-            futures = [executor.submit(_process_candidate_chunk_fast, b) for b in batches]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_process_candidate_chunk, b[0], b[1], inv_idx, b[2])
+                for b in batches
+            ]
             for future in as_completed(futures):
                 final_candidates.update(future.result())
 
         return final_candidates
 
-_G_INVERTED_INDEXES = None
-
-def _init_blocker_worker(inverted_indexes):
-    global _G_INVERTED_INDEXES
-    _G_INVERTED_INDEXES = inverted_indexes
-
-def _process_candidate_chunk_fast(args):
-    s1_chunk, tfidf_chunk, max_candidates_per_s1 = args
-    return _process_candidate_chunk(s1_chunk, tfidf_chunk, _G_INVERTED_INDEXES, max_candidates_per_s1)
 
 def _process_candidate_chunk(s1_chunk, tfidf_chunk, inverted_indexes, max_candidates_per_s1):
     final_candidates = {}
